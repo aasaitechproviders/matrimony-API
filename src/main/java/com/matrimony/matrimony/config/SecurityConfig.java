@@ -5,6 +5,7 @@ import com.matrimony.matrimony.repository.UserRepository;
 import com.matrimony.matrimony.service.CustomOAuth2UserService;
 import com.matrimony.matrimony.util.JwtAuthenticationFilter;
 import com.matrimony.matrimony.util.JwtUtil;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -53,14 +54,21 @@ public class SecurityConfig {
                 .oauth2Login(oauth2 -> oauth2
                         .userInfoEndpoint(userInfo -> userInfo.userService(customOAuth2UserService))
                         .successHandler((request, response, authentication) -> {
-                            var oAuth2User = (org.springframework.security.oauth2.core.user.DefaultOAuth2User) authentication.getPrincipal();
+                            var oAuth2User = (DefaultOAuth2User) authentication.getPrincipal();
                             String email = oAuth2User.getAttribute("email");
 
-                            // find or create user
+                            // ✅ find or create user
                             var user = userRepository.findByEmail(email)
-                                    .orElseThrow(() -> new RuntimeException("User not found"));
+                                    .orElseGet(() -> {
+                                        User newUser = new User();
+                                        newUser.setEmail(email);
+                                        newUser.setPassword(""); // Not needed for Google
+                                        newUser.setVerified(true);
+                                        newUser.setRole(User.Role.USER);
+                                        return userRepository.save(newUser);
+                                    });
 
-                            // generate JWT
+                            // ✅ generate JWT
                             String jwt = jwtUtil.generateToken(
                                     org.springframework.security.core.userdetails.User
                                             .withUsername(user.getEmail())
@@ -69,20 +77,34 @@ public class SecurityConfig {
                                             .build()
                             );
 
-                            // redirect to Angular profile page with token
+                            // ✅ redirect to Angular with token
                             String redirectUrl = "http://localhost:4200/profile?token=" + jwt;
                             response.sendRedirect(redirectUrl);
                         })
                 )
-                // ⚠️ Keep STATELESS for API (JWT) but OAuth2 will bypass because we handle success manually
                 .sessionManagement(session -> session
                         .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+                )
+                .exceptionHandling(ex -> ex
+                        .authenticationEntryPoint((request, response, authException) -> {
+                            response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Unauthorized");
+                        })
+                )
+                .logout(logout -> logout
+                        .logoutUrl("/auth/logout") // Angular will call this
+                        .invalidateHttpSession(true) // clear Spring Security session
+                        .deleteCookies("JSESSIONID", "SESSION") // clear cookies
+                        .logoutSuccessHandler((request, response, authentication) -> {
+                            response.setStatus(HttpServletResponse.SC_OK);
+                            response.getWriter().write("Logged out successfully");
+                        })
                 );
 
         http.addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
     }
+
 
 
     @Bean

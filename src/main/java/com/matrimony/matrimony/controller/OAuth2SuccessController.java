@@ -27,14 +27,14 @@ public class OAuth2SuccessController {
         DefaultOAuth2User oAuth2User = (DefaultOAuth2User) authentication.getPrincipal();
         String email = oAuth2User.getAttribute("email");
 
-        // Find user in DB
+        // ✅ At this point, user is guaranteed in DB
         User user = userRepository.findByEmail(email).orElseThrow();
 
         // Generate JWT
         String token = jwtUtil.generateToken(
                 org.springframework.security.core.userdetails.User
                         .withUsername(user.getEmail())
-                        .password("") // not needed for OAuth
+                        .password("")
                         .authorities("ROLE_" + user.getRole().name())
                         .build()
         );
@@ -43,4 +43,5 @@ public class OAuth2SuccessController {
         String redirectUrl = "http://localhost:4200/login?token=" + token;
         response.sendRedirect(redirectUrl);
     }
+
 }

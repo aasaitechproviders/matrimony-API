@@ -74,11 +74,7 @@ public class AuthController {
         return ResponseEntity.ok(new AuthResponse(jwt));
     }
 
-    // ✅ Logout
-    @PostMapping("/logout")
-    public ResponseEntity<String> logout() {
-        return ResponseEntity.ok("Logged out successfully! (Discard JWT on client side)");
-    }
+
 
     // ✅ Update user profile
     @PutMapping("/update")

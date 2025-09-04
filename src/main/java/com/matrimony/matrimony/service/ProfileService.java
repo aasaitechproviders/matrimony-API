@@ -130,7 +130,16 @@ public class ProfileService {
     public Optional<Profile> getProfileByEmail(String email) {
         return profileRepository.findByUserEmail(email);
     }
-
+    public Profile getProfileByUser(User user) {
+        return profileRepository.findByUserId(user.getId())
+                .orElseGet(() -> {
+                    // Create a blank profile if not exists
+                    Profile newProfile = new Profile();
+                    newProfile.setUser(user);
+                    newProfile.setEmail(user.getEmail());
+                    return profileRepository.save(newProfile);
+                });
+    }
 
 
 }

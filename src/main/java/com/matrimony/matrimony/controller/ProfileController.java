@@ -31,10 +31,15 @@ public class ProfileController {
     }
     @GetMapping("/byEmail")
     public ResponseEntity<Profile> getProfileByEmail(Authentication auth) {
-        String email = auth.getName();  // JWT subject is email
-        return profileService.getProfileByEmail(email)
-                .map(ResponseEntity::ok)
-                .orElse(ResponseEntity.notFound().build());
+        String email = auth.getName();  // ✅ JWT subject is email
+
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("User not found"));
+
+        // ✅ Get profile if exists, otherwise create a new one
+        Profile profile = profileService.getProfileByUser(user);
+
+        return ResponseEntity.ok(profile);
     }
 
     @PostMapping(consumes = {"multipart/form-data"})
