@@ -73,7 +73,10 @@ public class Profile {
     private String diet;     // Veg / Non-Veg / Vegan / Eggetarian
     private String smoking;  // Yes / No
     private String drinking; // Yes / No
-
+    // Location preferences – pick either these or keep your single 'location'
+    private String country;      // OPTIONAL
+    private String state;        // OPTIONAL
+    private String city;         // OPTIONAL
     // 🔹 Additional Info
     private String birthTime;    // HH:mm format
     private String birthPlace;   // city/town/village

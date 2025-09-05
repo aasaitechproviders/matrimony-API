@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -92,7 +93,10 @@ public class ProfileService {
         profile.setBirthPlace(profileData.getBirthPlace());
         profile.setAddress(profileData.getAddress());
         profile.setHobbies(profileData.getHobbies());
-        profile.setCreatedDate(profileData.getCreatedDate());
+        profile.setCreatedDate(LocalDate.now());
+        profile.setCountry(profileData.getCountry());
+        profile.setCity(profileData.getCity());
+        profile.setState(profileData.getState());
 
         // ✅ Handle new photos if provided
         if (photos != null && !photos.isEmpty()) {
