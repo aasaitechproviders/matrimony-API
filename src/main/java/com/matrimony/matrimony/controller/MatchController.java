@@ -4,6 +4,7 @@ import com.matrimony.matrimony.entity.Preferences;
 import com.matrimony.matrimony.entity.Profile;
 import com.matrimony.matrimony.entity.User;
 import com.matrimony.matrimony.repository.PreferencesRepository;
+import com.matrimony.matrimony.repository.PremiumRepository;
 import com.matrimony.matrimony.repository.ProfileRepository;
 import com.matrimony.matrimony.repository.UserRepository;
 import org.springframework.security.core.Authentication;
@@ -13,215 +14,283 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
 import java.time.Period;
-import java.util.*;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
+/**
+ * Combined MatchController:
+ *  - GET /matches         -> percentage-match (0..100) using criteria-count method
+ *  - GET /matches/suggested -> weighted score with boosts (premium/recent) returning integer score
+ */
 @RestController
 @RequestMapping("/matches")
 public class MatchController {
 
-    private final UserRepository userRepository;
-    private final ProfileRepository profileRepository;
-    private final PreferencesRepository preferencesRepository;
+    private final UserRepository userRepo;
+    private final ProfileRepository profileRepo;
+    private final PreferencesRepository prefRepo;
+    private final PremiumRepository premiumRepo;
 
-    public MatchController(UserRepository userRepository,
-                           ProfileRepository profileRepository,
-                           PreferencesRepository preferencesRepository) {
-        this.userRepository = userRepository;
-        this.profileRepository = profileRepository;
-        this.preferencesRepository = preferencesRepository;
+    public MatchController(UserRepository userRepo,
+                           ProfileRepository profileRepo,
+                           PreferencesRepository prefRepo,
+                           PremiumRepository premiumRepo) {
+        this.userRepo = userRepo;
+        this.profileRepo = profileRepo;
+        this.prefRepo = prefRepo;
+        this.premiumRepo = premiumRepo;
     }
 
-    // --- Helper: compute age from DOB safely
-    private int calculateAge(LocalDate dob) {
-        if (dob == null) return -1;
-        return Period.between(dob, LocalDate.now()).getYears();
-    }
+    /* -----------------------
+       DTOs
+       ----------------------- */
+    public record MatchResult(Profile profile, double score) {}      // for percentage endpoint
+    public record MatchDto(Profile profile, int score) {}            // for suggested endpoint
 
-    // --- DTO to return profile + score
-    public static record MatchResult(Profile profile, double score) {}
-
+    /* -----------------------
+       Endpoint: percentage-based matching
+       GET /matches
+       ----------------------- */
     @GetMapping
     public List<MatchResult> findMatches(Authentication auth) {
         String email = auth.getName();
+        User user = userRepo.findByEmail(email).orElseThrow(() -> new RuntimeException("User not found"));
 
-        // 1) Find logged-in user
-        User user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+        // try findByUser or findByUserId (choose the one your repo exposes)
+        Profile myProfile = profileRepo.findByUser(user)
+                .orElseGet(() -> profileRepo.findByUserId(user.getId())
+                        .orElseThrow(() -> new RuntimeException("Profile not found")));
 
-        // 2) Find logged-in user's profile (use findByUserId)
-        Profile myProfile = profileRepository.findByUserId(user.getId())
-                .orElseThrow(() -> new RuntimeException("Profile not found"));
+        Preferences prefs = prefRepo.findByProfile(myProfile).orElse(null);
 
-        // 3) Find preferences for this profile; if none, return empty list or default
-        Preferences prefs = preferencesRepository.findByProfile(myProfile)
-                .orElse(null);
+        List<Profile> allProfiles = profileRepo.findAll();
 
-        // 4) Get all other profiles
-        List<Profile> allProfiles = profileRepository.findAll();
+        String desiredGender = oppositeGender(myProfile.getGender());
 
-        // 5) Determine desired gender (opposite of logged-in user's gender)
-        String myGender = myProfile.getGender() == null ? "" : myProfile.getGender().trim();
-        String desiredGender = switch (myGender.toLowerCase(Locale.ROOT)) {
-            case "male" -> "female";
-            case "female" -> "male";
-            default -> ""; // empty => no gender filter (you can choose default behavior)
-        };
-
-        // 6) If no preferences set, return default empty or all opposite gender sorted by some basic rule.
+        // if no prefs, return opposite-gender list with score 0
         if (prefs == null) {
             return allProfiles.stream()
                     .filter(p -> !p.getId().equals(myProfile.getId()))
                     .filter(p -> desiredGender.isEmpty() || (p.getGender() != null && p.getGender().equalsIgnoreCase(desiredGender)))
-                    .map(p -> new MatchResult(p, 0.0))
+                    .map(p -> {
+                        sanitizeUserPassword(p);
+                        return new MatchResult(p, 0.0);
+                    })
                     .collect(Collectors.toList());
         }
 
-        // 7) Compute score for each candidate, filter and sort
-        List<MatchResult> results = allProfiles.stream()
-                .filter(p -> !p.getId().equals(myProfile.getId())) // skip self
-                .filter(p -> {
-                    // filter by opposite gender if desiredGender is set
-                    if (!desiredGender.isBlank()) {
-                        return p.getGender() != null && p.getGender().equalsIgnoreCase(desiredGender);
-                    }
-                    return true;
-                })
-                .map(candidate -> new MatchResult(candidate, calculateMatchScore(candidate, prefs)))
-                // only include scoring >= 20% (adjust threshold here if you want)
-                .filter(mr -> mr.score() >= 20.0)
+        return allProfiles.stream()
+                .filter(p -> !p.getId().equals(myProfile.getId()))
+                .filter(p -> desiredGender.isEmpty() || (p.getGender() != null && p.getGender().equalsIgnoreCase(desiredGender)))
+                .map(candidate -> new MatchResult(candidate, calculateMatchScorePercentage(candidate, prefs)))
+                .filter(mr -> mr.score() >= 20.0) // keep only >= 20%
                 .sorted(Comparator.comparingDouble(MatchResult::score).reversed())
+                .map(mr -> { sanitizeUserPassword(mr.profile()); return mr; })
                 .collect(Collectors.toList());
-
-        return results;
     }
 
-    /**
-     * Compute a match score (0..100) between candidate profile and preferences.
-     * Only preference fields that are specified (non-null, non-empty, not "Any")
-     * count toward the total number of criteria.
-     */
-    private double calculateMatchScore(Profile candidate, Preferences prefs) {
+    /* -----------------------
+       Endpoint: weighted suggested matches
+       GET /matches/suggested
+       ----------------------- */
+    @GetMapping("/suggested")
+    public List<MatchDto> suggested(Authentication auth) {
+        String email = auth.getName();
+        User me = userRepo.findByEmail(email).orElseThrow(() -> new RuntimeException("User not found"));
+
+        Profile myProfile = profileRepo.findByUser(me)
+                .orElseGet(() -> profileRepo.findByUserId(me.getId())
+                        .orElseThrow(() -> new RuntimeException("Profile not found")));
+
+        Preferences prefs = prefRepo.findByProfile(myProfile).orElse(null);
+
+        List<Profile> all = profileRepo.findAll();
+
+        String desiredGender = oppositeGender(myProfile.getGender());
+
+        return all.stream()
+                .filter(p -> !p.getId().equals(myProfile.getId()))
+                .filter(p -> desiredGender.isEmpty() || (p.getGender() != null && p.getGender().equalsIgnoreCase(desiredGender)))
+                .map(p -> {
+                    double score = calculateWeightedScore(p, prefs);
+                    if (isPremium(p.getUser())) score += 4;
+                    if (isRecentlyJoined(p)) score += 2;
+                    int finalScore = (int) Math.min(100, Math.round(score));
+                    sanitizeUserPassword(p);
+                    return new MatchDto(p, finalScore);
+                })
+                .filter(m -> m.score() >= 20) // threshold
+                .sorted(Comparator.comparingInt(MatchDto::score).reversed())
+                .collect(Collectors.toList());
+    }
+
+    /* -----------------------
+       Scoring: percentage-style (0..100) based on number of specified criteria
+       ----------------------- */
+    private double calculateMatchScorePercentage(Profile candidate, Preferences prefs) {
         int totalCriteria = 0;
         int matchedCriteria = 0;
 
-        // --- Age
+        // Age
         if (prefs.getMinAge() > 0 || prefs.getMaxAge() > 0) {
             totalCriteria++;
-            int candidateAge = calculateAge(candidate.getDob());
-            if (candidateAge >= 0 &&
-                    candidateAge >= prefs.getMinAge() && candidateAge <= prefs.getMaxAge()) {
+            int candidateAge = safeAge(candidate.getDob());
+            if (candidateAge >= 0 && candidateAge >= prefs.getMinAge() && candidateAge <= prefs.getMaxAge()) {
                 matchedCriteria++;
             }
         }
 
-        // --- Height
+        // Height
         if (prefs.getMinHeight() > 0 || prefs.getMaxHeight() > 0) {
             totalCriteria++;
             Double candHeight = candidate.getHeight();
-            if (candHeight != null &&
-                    candHeight >= prefs.getMinHeight() &&
-                    candHeight <= prefs.getMaxHeight()) {
+            if (candHeight != null && candHeight >= prefs.getMinHeight() && candHeight <= prefs.getMaxHeight()) {
                 matchedCriteria++;
             }
         }
 
-        // --- Religion
-        if (isSpecified(prefs.getReligion())) {
-            totalCriteria++;
-            if (candidate.getReligion() != null && candidate.getReligion().equalsIgnoreCase(prefs.getReligion())) {
-                matchedCriteria++;
-            }
-        }
+        // Religion, Caste, Education, Profession
+        if (isSpecified(prefs.getReligion())) { totalCriteria++; if (equalsIgnoreCase(candidate.getReligion(), prefs.getReligion())) matchedCriteria++; }
+        if (isSpecified(prefs.getCaste()))    { totalCriteria++; if (equalsIgnoreCase(candidate.getCaste(), prefs.getCaste())) matchedCriteria++; }
+        if (isSpecified(prefs.getEducation())){ totalCriteria++; if (equalsIgnoreCase(candidate.getEducation(), prefs.getEducation())) matchedCriteria++; }
+        if (isSpecified(prefs.getProfession())){ totalCriteria++; String candProf = candidate.getProfession() != null ? candidate.getProfession() : candidate.getEmploymentType(); if (equalsIgnoreCase(candProf, prefs.getProfession())) matchedCriteria++; }
 
-        // --- Caste
-        if (isSpecified(prefs.getCaste())) {
-            totalCriteria++;
-            if (candidate.getCaste() != null && candidate.getCaste().equalsIgnoreCase(prefs.getCaste())) {
-                matchedCriteria++;
-            }
-        }
+        // Location
+        if (isSpecified(prefs.getCountry())) { totalCriteria++; if (equalsIgnoreCase(candidate.getCountry(), prefs.getCountry())) matchedCriteria++; }
+        if (isSpecified(prefs.getState()))   { totalCriteria++; if (equalsIgnoreCase(candidate.getState(), prefs.getState())) matchedCriteria++; }
+        if (isSpecified(prefs.getCity()))    { totalCriteria++; if (equalsIgnoreCase(candidate.getCity(), prefs.getCity())) matchedCriteria++; }
 
-        // --- Education
-        if (isSpecified(prefs.getEducation())) {
-            totalCriteria++;
-            if (candidate.getEducation() != null && candidate.getEducation().equalsIgnoreCase(prefs.getEducation())) {
-                matchedCriteria++;
-            }
-        }
+        // Lifestyle
+        if (isSpecified(prefs.getDiet()))    { totalCriteria++; if (equalsIgnoreCase(candidate.getDiet(), prefs.getDiet())) matchedCriteria++; }
+        if (isSpecified(prefs.getSmoking())) { totalCriteria++; if (equalsIgnoreCase(candidate.getSmoking(), prefs.getSmoking())) matchedCriteria++; }
+        if (isSpecified(prefs.getDrinking())){ totalCriteria++; if (equalsIgnoreCase(candidate.getDrinking(), prefs.getDrinking())) matchedCriteria++; }
 
-        // --- Profession
-        if (isSpecified(prefs.getProfession())) {
-            totalCriteria++;
-            // Note: candidate may use employmentType or profession - adjust accordingly
-            String candProf = candidate.getProfession() != null ? candidate.getProfession() : candidate.getEmploymentType();
-            if (candProf != null && candProf.equalsIgnoreCase(prefs.getProfession())) {
-                matchedCriteria++;
-            }
-        }
-
-        // --- Location: country/state/city (each counts if provided)
-        if (isSpecified(prefs.getCountry())) {
-            totalCriteria++;
-            if (candidate.getCountry() != null && candidate.getCountry().equalsIgnoreCase(prefs.getCountry())) {
-                matchedCriteria++;
-            }
-        }
-        if (isSpecified(prefs.getState())) {
-            totalCriteria++;
-            if (candidate.getState() != null && candidate.getState().equalsIgnoreCase(prefs.getState())) {
-                matchedCriteria++;
-            }
-        }
-        if (isSpecified(prefs.getCity())) {
-            totalCriteria++;
-            if (candidate.getCity() != null && candidate.getCity().equalsIgnoreCase(prefs.getCity())) {
-                matchedCriteria++;
-            }
-        }
-
-        // --- Lifestyle: diet
-        if (isSpecified(prefs.getDiet())) {
-            totalCriteria++;
-            if (candidate.getDiet() != null && candidate.getDiet().equalsIgnoreCase(prefs.getDiet())) {
-                matchedCriteria++;
-            }
-        }
-
-        // --- Lifestyle: smoking
-        if (isSpecified(prefs.getSmoking())) {
-            totalCriteria++;
-            if (candidate.getSmoking() != null && candidate.getSmoking().equalsIgnoreCase(prefs.getSmoking())) {
-                matchedCriteria++;
-            }
-        }
-
-        // --- Lifestyle: drinking
-        if (isSpecified(prefs.getDrinking())) {
-            totalCriteria++;
-            if (candidate.getDrinking() != null && candidate.getDrinking().equalsIgnoreCase(prefs.getDrinking())) {
-                matchedCriteria++;
-            }
-        }
-
-        // If no criteria were defined, return 0
-        if (totalCriteria == 0) {
-            return 0.0;
-        }
-
-        // compute percentage
+        if (totalCriteria == 0) return 0.0;
         double score = (matchedCriteria * 100.0) / totalCriteria;
-        // clamp and round
-        if (score < 0) score = 0;
-        if (score > 100) score = 100;
-        return Math.round(score * 100.0) / 100.0; // round to 2 decimals
+        return Math.round(Math.max(0, Math.min(100, score)) * 100.0) / 100.0;
     }
 
-    // Helper: treat null/empty/"any" as unspecified
+    /* -----------------------
+       Scoring: weighted scoring used by /suggested endpoint
+       (weights tuned from your example)
+       ----------------------- */
+    private double calculateWeightedScore(Profile p, Preferences prefs) {
+        double score = 0.0;
+        if (prefs == null) return 50.0; // fallback when user didn't set preferences
+
+        // Age (max 25)
+        if (p.getDob() != null) {
+            int age = safeAge(p.getDob());
+            if (age >= prefs.getMinAge() && age <= prefs.getMaxAge()) score += 25;
+            else {
+                if (Math.abs(age - prefs.getMinAge()) <= 3 || Math.abs(age - prefs.getMaxAge()) <= 3) score += 10;
+            }
+        }
+
+        // Height (max 10)
+        if (p.getHeight() != null && prefs.getMinHeight() > 0 && prefs.getMaxHeight() > 0) {
+            double h = p.getHeight();
+            if (h >= prefs.getMinHeight() && h <= prefs.getMaxHeight()) score += 10;
+            else {
+                if (Math.abs(h - prefs.getMinHeight()) <= 5 || Math.abs(h - prefs.getMaxHeight()) <= 5) score += 4;
+            }
+        }
+
+        // Religion (15) / Caste (5)
+        if (!isEmpty(prefs.getReligion())) {
+            if (equalsIgnoreCase(p.getReligion(), prefs.getReligion())) score += 15;
+        } else score += 5;
+        if (!isEmpty(prefs.getCaste())) {
+            if (equalsIgnoreCase(p.getCaste(), prefs.getCaste())) score += 5;
+        } else score += 1;
+
+        // Education (8) / Profession (2)
+        if (!isEmpty(prefs.getEducation())) {
+            if (equalsIgnoreCase(p.getEducation(), prefs.getEducation())) score += 8;
+        } else score += 2;
+        if (!isEmpty(prefs.getProfession())) {
+            String candProf = p.getEmploymentType() != null ? p.getEmploymentType() : p.getProfession();
+            if (equalsIgnoreCase(candProf, prefs.getProfession())) score += 2;
+        }
+
+        // Location (country) (5)
+        if (!isEmpty(prefs.getCountry())) {
+            if (equalsIgnoreCase(p.getCountry(), prefs.getCountry())) score += 5;
+        } else score += 1;
+
+        // Lifestyle: diet (6), smoking (3), drinking (3)
+        if (!isEmpty(prefs.getDiet())) {
+            if (equalsIgnoreCase(p.getDiet(), prefs.getDiet())) score += 6;
+        } else score += 1;
+        if (!isEmpty(prefs.getSmoking())) {
+            if (equalsIgnoreCase(p.getSmoking(), prefs.getSmoking())) score += 3;
+        }
+        if (!isEmpty(prefs.getDrinking())) {
+            if (equalsIgnoreCase(p.getDrinking(), prefs.getDrinking())) score += 3;
+        }
+
+        return Math.min(100.0, score);
+    }
+
+    /* -----------------------
+       Helpers
+       ----------------------- */
+    private String oppositeGender(String gender) {
+        if (gender == null) return "";
+        String g = gender.trim().toLowerCase(Locale.ROOT);
+        return switch (g) {
+            case "male" -> "female";
+            case "female" -> "male";
+            default -> "";
+        };
+    }
+
+    private int safeAge(LocalDate dob) {
+        if (dob == null) return -1;
+        return Period.between(dob, LocalDate.now()).getYears();
+    }
+
+    private boolean isRecentlyJoined(Profile p) {
+        if (p == null || p.getCreatedDate() == null) return false;
+        return p.getCreatedDate().isAfter(LocalDate.now().minusDays(7));
+    }
+
+    private boolean equalsIgnoreCase(String a, String b) {
+        if (a == null || b == null) return false;
+        return a.trim().equalsIgnoreCase(b.trim());
+    }
+
+    private boolean isEmpty(String s) {
+        return s == null || s.trim().isEmpty() || s.trim().equalsIgnoreCase("any");
+    }
+
     private boolean isSpecified(String s) {
-        if (s == null) return false;
-        String trimmed = s.trim();
-        if (trimmed.isEmpty()) return false;
-        return !trimmed.equalsIgnoreCase("any");
+        return !isEmpty(s);
+    }
+
+    private void sanitizeUserPassword(Profile p) {
+        if (p != null && p.getUser() != null) {
+            p.getUser().setPassword(null);
+        }
+    }
+
+    /**
+     * Implement according to your PremiumRepository: return true if this user's premium subscription is active.
+     * Example repo methods:
+     *   boolean existsByUserIdAndActiveTrue(Long userId);
+     * or
+     *   Optional<Premium> findActiveByUserId(Long userId);
+     */
+    private boolean isPremium(User u) {
+        if (u == null) return false;
+        try {
+            // adapt to your repo
+            // return premiumRepo.existsByUserIdAndActiveTrue(u.getId());
+            return premiumRepo.isActiveForUser(u.getId()); // implement this helper in PremiumRepository
+        } catch (Exception ex) {
+            return false;
+        }
     }
 }

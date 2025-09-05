@@ -13,21 +13,22 @@ import java.time.LocalDateTime;
 @AllArgsConstructor
 @Builder
 public class Interest {
-
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    // sender user
-    @ManyToOne
-    @JoinColumn(name = "from_user_id", nullable = false)
+    // who expressed interest
+    @ManyToOne(optional = false) @JoinColumn(name = "from_user_id")
     private User fromUser;
 
-    // receiver user
-    @ManyToOne
-    @JoinColumn(name = "to_user_id", nullable = false)
+    // who received interest (profile owner)
+    @ManyToOne(optional = false) @JoinColumn(name = "to_user_id")
     private User toUser;
 
-    private String status = "PENDING"; // PENDING / ACCEPTED / REJECTED
-    private LocalDateTime createdAt = LocalDateTime.now();
+    @Enumerated(EnumType.STRING)
+    private Status status; // PENDING, ACCEPTED, REJECTED
+
+    private LocalDateTime createdAt;
+
+    public enum Status { PENDING, ACCEPTED, REJECTED }
 }
